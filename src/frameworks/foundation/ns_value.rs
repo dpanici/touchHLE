@@ -16,7 +16,7 @@ use crate::frameworks::core_foundation::cf_number::{
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_keyed_archiver::get_value_to_encode_for_current_key;
 use crate::frameworks::foundation::NSInteger;
-use crate::mem::{ConstVoidPtr, MutVoidPtr};
+use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, MutVoidPtr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports,
     HostObject, NSZonePtr,
@@ -29,8 +29,71 @@ pub(super) enum NSValueHostObject {
     CGPoint(CGPoint),
     CGSize(CGSize),
     CGRect(CGRect),
+    /// Arbitrary data, e.g. from `value:withObjCType:`.
+    Bytes(Vec<u8>),
 }
 impl HostObject for NSValueHostObject {}
+
+/// Get the size and alignment of the type described by an Objective-C type
+/// encoding (e.g. `{CGPoint=ff}`), and the rest of the string after it.
+/// Returns [None] for unsupported encodings (e.g. bit-fields).
+fn size_and_alignment_of_objc_type(encoding: &[u8]) -> Option<(GuestUSize, GuestUSize, &[u8])> {
+    let (&first, mut rest) = encoding.split_first()?;
+    let (size, align) = match first {
+        // Type qualifiers (const, in, out, etc.) don't affect the layout.
+        b'r' | b'n' | b'N' | b'o' | b'O' | b'R' | b'V' => {
+            return size_and_alignment_of_objc_type(rest);
+        }
+        b'v' => (0, 1),
+        b'c' | b'C' | b'B' => (1, 1),
+        b's' | b'S' => (2, 2),
+        b'i' | b'I' | b'l' | b'L' | b'f' | b'*' | b'@' | b'#' | b':' => (4, 4),
+        // On 32-bit iOS, 8-byte types only have 4-byte alignment.
+        b'q' | b'Q' | b'd' => (8, 4),
+        b'^' => {
+            // Skip the pointee type.
+            let (_, _, after) = size_and_alignment_of_objc_type(rest)?;
+            rest = after;
+            (4, 4)
+        }
+        b'[' => {
+            let digits = rest.iter().take_while(|c| c.is_ascii_digit()).count();
+            let count: GuestUSize = std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()?;
+            let (size, align, after) = size_and_alignment_of_objc_type(&rest[digits..])?;
+            rest = after.strip_prefix(b"]")?;
+            (size * count, align)
+        }
+        b'{' | b'(' => {
+            let (is_union, close) = (first == b'(', if first == b'(' { b')' } else { b'}' });
+            // Skip the name, which may be followed by the member list.
+            let name_end = rest.iter().position(|&c| c == b'=' || c == close)?;
+            rest = &rest[name_end..];
+            let (mut size, mut align) = (0, 1);
+            if let Some(after) = rest.strip_prefix(b"=") {
+                rest = after;
+                while *rest.first()? != close {
+                    // Skip the member name, if present.
+                    if let Some(after) = rest.strip_prefix(b"\"") {
+                        let name_end = after.iter().position(|&c| c == b'"')?;
+                        rest = &after[name_end + 1..];
+                    }
+                    let (member_size, member_align, after) = size_and_alignment_of_objc_type(rest)?;
+                    rest = after;
+                    align = align.max(member_align);
+                    if is_union {
+                        size = size.max(member_size);
+                    } else {
+                        size = size.next_multiple_of(member_align) + member_size;
+                    }
+                }
+            }
+            rest = &rest[1..];
+            (size.next_multiple_of(align), align)
+        }
+        _ => return None,
+    };
+    Some((size, align, rest))
+}
 
 macro_rules! impl_AsValue {
     ($method_name:tt, $typ:tt) => {
@@ -108,6 +171,24 @@ pub const CLASSES: ClassExports = objc_classes! {
 // implemented here yet (TODO).
 @implementation NSValue: NSObject
 
++ (id)allocWithZone:(NSZonePtr)_zone {
+    // The value is filled in by initWithBytes:objCType:.
+    let host_object = Box::new(NSValueHostObject::Bytes(Vec::new()));
+    env.objc.alloc_object(this, host_object, &mut env.mem)
+}
+
++ (id)valueWithBytes:(ConstVoidPtr)value
+            objCType:(ConstPtr<u8>)objc_type {
+    let new: id = msg![env; this alloc];
+    let new: id = msg![env; new initWithBytes:value objCType:objc_type];
+    autorelease(env, new)
+}
+
++ (id)value:(ConstVoidPtr)value
+withObjCType:(ConstPtr<u8>)objc_type {
+    msg![env; this valueWithBytes:value objCType:objc_type]
+}
+
 + (id)valueWithPointer:(ConstVoidPtr)ptr {
     // TODO: implement with `value:withObjCType:` instead
     msg_class![env; NSNumber numberWithUnsignedInt:(ptr.to_bits())]
@@ -129,6 +210,32 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_object = Box::new(NSValueHostObject::CGRect(value));
     let new = env.objc.alloc_object(this, host_object, &mut env.mem);
     autorelease(env, new)
+}
+
+- (id)initWithBytes:(ConstVoidPtr)value
+           objCType:(ConstPtr<u8>)objc_type {
+    let objc_type = env.mem.cstr_at(objc_type);
+    let Some((size, _, _)) = size_and_alignment_of_objc_type(objc_type) else {
+        unimplemented!("NSValue with type encoding {:?}", String::from_utf8_lossy(objc_type));
+    };
+    let bytes = env.mem.bytes_at(value.cast(), size).to_vec();
+    *env.objc.borrow_mut::<NSValueHostObject>(this) = NSValueHostObject::Bytes(bytes);
+    this
+}
+
+- (())getValue:(MutVoidPtr)buffer {
+    match *env.objc.borrow::<NSValueHostObject>(this) {
+        NSValueHostObject::CGPoint(point) => env.mem.write(buffer.cast(), point),
+        NSValueHostObject::CGSize(size) => env.mem.write(buffer.cast(), size),
+        NSValueHostObject::CGRect(rect) => env.mem.write(buffer.cast(), rect),
+        NSValueHostObject::Bytes(ref bytes) => {
+            let bytes = bytes.clone();
+            let len: GuestUSize = bytes.len().try_into().unwrap();
+            if len != 0 {
+                env.mem.bytes_at_mut(buffer.cast(), len).copy_from_slice(&bytes);
+            }
+        }
+    }
 }
 
 - (CGPoint)CGPointValue {
@@ -303,10 +410,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())encodeWithCoder:(id)coder {
     let host_object = env.objc.borrow::<NSNumberHostObject>(this);
     let (key, val) = match host_object {
-        NSNumberHostObject::Int(i) => ("NS.intval", plist::Value::Integer((*i).into())),
-        NSNumberHostObject::Double(d) => ("NS.dblval", plist::Value::Real(*d)),
         NSNumberHostObject::Bool(b) => ("NS.boolval", plist::Value::Boolean(*b)),
-        _ => unimplemented!("{:?}", host_object)
+        NSNumberHostObject::Float(_) | NSNumberHostObject::Double(_) => {
+            ("NS.dblval", plist::Value::Real(host_object.as_double()))
+        }
+        NSNumberHostObject::UnsignedLongLong(u) => {
+            ("NS.intval", plist::Value::Integer((*u).into()))
+        }
+        _ => ("NS.intval", plist::Value::Integer(host_object.as_long_long().into())),
     };
 
     let scope = get_value_to_encode_for_current_key(env, coder);
@@ -376,6 +487,22 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithChar:(i8)value {
     *env.objc.borrow_mut(this) = NSNumberHostObject::Char(value);
     this
+}
+
+- (())getValue:(MutVoidPtr)buffer {
+    let buffer = buffer.cast();
+    match *env.objc.borrow::<NSNumberHostObject>(this) {
+        NSNumberHostObject::Bool(x) => env.mem.write(buffer, x as u8),
+        NSNumberHostObject::UnsignedLongLong(x) => env.mem.write(buffer.cast(), x),
+        NSNumberHostObject::UnsignedInt(x) => env.mem.write(buffer.cast(), x),
+        NSNumberHostObject::Int(x) => env.mem.write(buffer.cast(), x),
+        NSNumberHostObject::LongLong(x) => env.mem.write(buffer.cast(), x),
+        NSNumberHostObject::Float(x) => env.mem.write(buffer.cast(), x),
+        NSNumberHostObject::Double(x) => env.mem.write(buffer.cast(), x),
+        NSNumberHostObject::Short(x) => env.mem.write(buffer.cast(), x),
+        NSNumberHostObject::UnsignedShort(x) => env.mem.write(buffer.cast(), x),
+        NSNumberHostObject::Char(x) => env.mem.write(buffer.cast(), x),
+    }
 }
 
 - (bool)boolValue {
@@ -556,4 +683,31 @@ pub fn is_conversion_lossless(env: &mut Environment, this: id, type_: CFNumberTy
         _ => unimplemented!("is_conversion_lossless for {}", type_),
     };
     msg![env; this isEqualToNumber:num2]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::size_and_alignment_of_objc_type;
+
+    fn size_of(encoding: &str) -> Option<u32> {
+        size_and_alignment_of_objc_type(encoding.as_bytes()).map(|(size, _, rest)| {
+            assert!(rest.is_empty());
+            size
+        })
+    }
+
+    #[test]
+    fn objc_type_sizes() {
+        assert_eq!(size_of("i"), Some(4));
+        assert_eq!(size_of("{Vector3=fff}"), Some(12));
+        assert_eq!(size_of("{Vector3=\"x\"f\"y\"f\"z\"f}"), Some(12));
+        assert_eq!(size_of("{CGRect={CGPoint=ff}{CGSize=ff}}"), Some(16));
+        assert_eq!(size_of("{Foo=cid}"), Some(16));
+        assert_eq!(size_of("{Foo=cs}"), Some(4));
+        assert_eq!(size_of("[3{Foo=ci}]"), Some(24));
+        assert_eq!(size_of("(Foo=cd)"), Some(8));
+        assert_eq!(size_of("^{Opaque}"), Some(4));
+        assert_eq!(size_of("r*"), Some(4));
+        assert_eq!(size_of("b3"), None);
+    }
 }

@@ -217,6 +217,9 @@ pub struct Window {
     event_pump: sdl2::EventPump,
     event_queue: VecDeque<Event>,
     last_polled: Instant,
+    // DEBUG HACK (scripted input), do not commit.
+    debug_input: VecDeque<String>,
+    debug_input_wait_until: Option<Instant>,
     /// Separate queue for extremely high-priority events (e.g. app about to
     /// terminate).
     high_priority_event: Option<Event>,
@@ -370,6 +373,8 @@ impl Window {
             event_pump,
             event_queue: VecDeque::new(),
             last_polled: Instant::now() - Duration::from_secs(1),
+            debug_input: VecDeque::new(),
+            debug_input_wait_until: None,
             high_priority_event: None,
             enable_event_polling: true,
             #[cfg(target_os = "macos")]
@@ -488,6 +493,44 @@ impl Window {
         fn finger_absolute_coords(window: &Window, (x, y): (f32, f32)) -> (f32, f32) {
             let (screen_width, screen_height) = window.window.drawable_size();
             (screen_width as f32 * x, screen_height as f32 * y)
+        }
+
+        // DEBUG HACK (scripted input), do not commit.
+        // Lines in $TOUCHHLE_DEBUG_INPUT_FILE: "down X Y", "move X Y", "up X Y"
+        // (window points, title bar excluded) or "wait MS". File is consumed.
+        if let Ok(path) = std::env::var("TOUCHHLE_DEBUG_INPUT_FILE") {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let _ = std::fs::remove_file(&path);
+                self.debug_input.extend(text.lines().map(str::to_string));
+            }
+            while self.debug_input_wait_until.is_none_or(|t| now >= t) {
+                let Some(line) = self.debug_input.pop_front() else {
+                    break;
+                };
+                self.debug_input_wait_until = None;
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                match parts.as_slice() {
+                    ["wait", ms] => {
+                        self.debug_input_wait_until =
+                            Some(now + Duration::from_millis(ms.parse().unwrap()))
+                    }
+                    [kind @ ("down" | "move" | "up"), x, y] => {
+                        let coords = transform_input_coords(
+                            self,
+                            (x.parse().unwrap(), y.parse().unwrap()),
+                            false,
+                        );
+                        echo!("Debug input: {} {:?}", kind, coords);
+                        let touches = HashMap::from([(FingerId::Mouse, coords)]);
+                        self.event_queue.push_back(match *kind {
+                            "down" => Event::TouchesDown(touches),
+                            "move" => Event::TouchesMove(touches),
+                            _ => Event::TouchesUp(touches),
+                        });
+                    }
+                    _ => echo!("Bad debug input line: {:?}", line),
+                }
+            }
         }
 
         let mut controller_updated = false;

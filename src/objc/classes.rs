@@ -439,6 +439,13 @@ impl ClassHostObject {
     // See methods.rs for binary method parsing
 }
 
+/// Read the name of a class from the guest app's binary.
+fn class_name_from_bin(mem: &Mem, class: Class) -> &str {
+    let class_t { data, .. } = mem.read(class.cast());
+    let class_rw_t { name, .. } = mem.read(data);
+    mem.cstr_at_utf8(name).unwrap()
+}
+
 /// Decide whether a certain class/metaclass pair from the guest app should use
 /// fake class host objects and return the substitutions if so.
 ///
@@ -450,10 +457,9 @@ fn substitute_classes(
     mem: &Mem,
     class: Class,
     metaclass: Class,
+    has_plus_sdk: bool,
 ) -> Option<(Box<FakeClass>, Box<FakeClass>)> {
-    let class_t { data, .. } = mem.read(class.cast());
-    let class_rw_t { name, .. } = mem.read(data);
-    let name = mem.cstr_at_utf8(name).unwrap();
+    let name = class_name_from_bin(mem, class);
 
     // Currently the only thing we try to substitute: classes that seem to be
     // from various third-party advertising or social network SDKs.
@@ -467,7 +473,11 @@ fn substitute_classes(
         || name.starts_with("Flurry")
         || name.starts_with("Mobclix")
         || name.starts_with("OpenFeint")
-        || name.starts_with("Tapjoy"))
+        || name.starts_with("Tapjoy")
+        // ngmoco's Plus+ social network. "NG" is too generic a prefix to
+        // match unconditionally, so this is only done if the app contains
+        // the SDK's main class.
+        || (has_plus_sdk && name.starts_with("NG")))
     {
         return None;
     }
@@ -640,11 +650,14 @@ impl ObjC {
 
         assert!(list.size % 4 == 0);
         let base: ConstPtr<Class> = Ptr::from_bits(list.addr);
+        let has_plus_sdk = (0..(list.size / 4))
+            .any(|i| class_name_from_bin(mem, mem.read(base + i)) == "NGPlatform");
         for i in 0..(list.size / 4) {
             let class = mem.read(base + i);
             let metaclass = Self::read_isa(class, mem);
 
-            let name = if let Some(fakes) = substitute_classes(mem, class, metaclass) {
+            let name = if let Some(fakes) = substitute_classes(mem, class, metaclass, has_plus_sdk)
+            {
                 let (class_host_object, metaclass_host_object) = fakes;
 
                 assert!(class_host_object.name == metaclass_host_object.name);

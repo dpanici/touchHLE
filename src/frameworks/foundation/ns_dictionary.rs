@@ -493,6 +493,43 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     msg![env; this isEqualToDictionary:other]
 }
+- (id)keyEnumerator { // NSEnumerator*
+    let keys: id = msg![env; this allKeys];
+    msg![env; keys objectEnumerator]
+}
+
+- (id)allValues {
+    let keys: id = msg![env; this allKeys];
+    let count: NSUInteger = msg![env; keys count];
+    let mut values = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let key: id = msg![env; keys objectAtIndex:i];
+        let value: id = msg![env; this objectForKey:key];
+        values.push(retain(env, value));
+    }
+    let res = ns_array::from_vec(env, values);
+    autorelease(env, res)
+}
+
+- (id)objectEnumerator { // NSEnumerator*
+    let values: id = msg![env; this allValues];
+    msg![env; values objectEnumerator]
+}
+
+- (id)objectsForKeys:(id)keys // NSArray*
+      notFoundMarker:(id)marker {
+    let count: NSUInteger = msg![env; keys count];
+    let mut objects = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let key: id = msg![env; keys objectAtIndex:i];
+        let object: id = msg![env; this objectForKey:key];
+        let object = if object == nil { marker } else { object };
+        objects.push(retain(env, object));
+    }
+    let res = ns_array::from_vec(env, objects);
+    autorelease(env, res)
+}
+
 - (bool)isEqualToDictionary:(id)other { // NSDictionary *
     if other == nil {
         return false;
@@ -559,6 +596,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     let new: id = msg![env; this alloc];
     let new: id = msg![env; new initWithCapacity:capacity];
     autorelease(env, new)
+}
+
+- (())removeObjectsForKeys:(id)keys { // NSArray*
+    let count: NSUInteger = msg![env; keys count];
+    for i in 0..count {
+        let key: id = msg![env; keys objectAtIndex:i];
+        () = msg![env; this removeObjectForKey:key];
+    }
 }
 
 // These probably comes from some category related to plists.

@@ -280,6 +280,12 @@ fn get_value_to_decode_for_key(env: &mut Environment, unarchiver: id, key: id) -
 /// The object returned is retained only by the archiver. Remember to retain and
 /// possibly autorelease it as appropriate.
 fn unarchive_key(env: &mut Environment, unarchiver: id, key: Uid) -> id {
+    // The first item in `$objects` is always the string "$null", which
+    // represents nil.
+    if key.get() == 0 {
+        return nil;
+    }
+
     let host_obj = borrow_host_obj(env, unarchiver);
     if let Some(existing) = host_obj.already_unarchived[key.get() as usize] {
         return existing;
@@ -319,6 +325,12 @@ fn unarchive_key(env: &mut Environment, unarchiver: id, key: Uid) -> id {
             host_obj.current_key = Some(key);
 
             let new_object: id = msg![env; class alloc];
+            // The object must be registered before it is initialized, in case
+            // the object graph has cycles (otherwise this would recurse
+            // forever). It's replaced below if initWithCoder: returns a
+            // different object.
+            borrow_host_obj(env, unarchiver).already_unarchived[key.get() as usize] =
+                Some(new_object);
             let new_object: id = msg![env; new_object initWithCoder:unarchiver];
 
             let host_obj = borrow_host_obj(env, unarchiver); // reborrow

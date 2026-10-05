@@ -176,6 +176,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setObject:(id)object
          forKey:(id)key { // NSString*
+    // Setting nil removes the value, unlike for NSMutableDictionary.
+    if object == nil {
+        return msg![env; this removeObjectForKey:key];
+    }
     // Only app domain gets affected!
     let dict = env.objc.borrow::<NSUserDefaultsHostObject>(this).app_domain_dict;
     msg![env; dict setObject:object forKey:key]

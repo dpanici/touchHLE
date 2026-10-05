@@ -18,7 +18,7 @@ use plist::{to_writer_binary, Dictionary, Uid, Value};
 
 use crate::frameworks::foundation::ns_keyed_unarchiver::NSKeyedArchiveRootObjectKey;
 use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
-use crate::frameworks::foundation::NSUInteger;
+use crate::frameworks::foundation::{NSInteger, NSUInteger};
 use crate::mem::{ConstPtr, GuestUSize};
 use crate::objc::{
     id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
@@ -28,8 +28,12 @@ use crate::Environment;
 struct NSKeyedArchiverHostObject {
     plist: Dictionary,
     encoded_data: id, // NSData *
+    /// `NSMutableData*` the archive is appended to by `finishEncoding`, if
+    /// initialized with `initForWritingWithMutableData:`.
+    output_data: id,
     current_key: Option<Uid>,
-    /// map of id => Uid
+    /// map of id => Uid. The objects are retained, so that their addresses
+    /// can't be reused by other objects while archiving.
     already_archived: HashMap<id, Uid>,
 }
 impl HostObject for NSKeyedArchiverHostObject {}
@@ -54,6 +58,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.alloc_object(this, Box::new(NSKeyedArchiverHostObject {
         plist,
         encoded_data: nil,
+        output_data: nil,
         current_key: None,
         already_archived
     }), &mut env.mem)
@@ -76,18 +81,51 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; data writeToFile:file atomically:true]
 }
 
+- (id)initForWritingWithMutableData:(id)data { // NSMutableData *
+    retain(env, data);
+    env.objc.borrow_mut::<NSKeyedArchiverHostObject>(this).output_data = data;
+    this
+}
+
 - (())encodeObject:(id)object // NSCoding *
             forKey:(id)key { // NSString *
     let key = normalize_key(env, key);
     encode_object_for_key(env, this, object, key);
 }
 
+- (())encodeBool:(bool)val
+          forKey:(id)key { // NSString *
+    encode_value_for_key(env, this, key, Value::Boolean(val));
+}
+
 - (())encodeInt:(i32)val
-         forKey:(id)key {
-    let key = normalize_key(env, key);
-    let scope = get_value_to_encode_for_current_key(env, this);
-    assert!(!scope.contains_key(&key));
-    scope.insert(key, Value::Integer(val.into()));
+         forKey:(id)key { // NSString *
+    encode_value_for_key(env, this, key, Value::Integer(val.into()));
+}
+
+- (())encodeInt32:(i32)val
+           forKey:(id)key { // NSString *
+    encode_value_for_key(env, this, key, Value::Integer(val.into()));
+}
+
+- (())encodeInteger:(NSInteger)val
+             forKey:(id)key { // NSString *
+    encode_value_for_key(env, this, key, Value::Integer(val.into()));
+}
+
+- (())encodeInt64:(i64)val
+           forKey:(id)key { // NSString *
+    encode_value_for_key(env, this, key, Value::Integer(val.into()));
+}
+
+- (())encodeFloat:(f32)val
+           forKey:(id)key { // NSString *
+    encode_value_for_key(env, this, key, Value::Real(val.into()));
+}
+
+- (())encodeDouble:(f64)val
+            forKey:(id)key { // NSString *
+    encode_value_for_key(env, this, key, Value::Real(val));
 }
 
 - (())encodeBytes:(ConstPtr<u8>)bytes
@@ -111,6 +149,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     let encoded_data: id = msg_class![env; NSData dataWithBytesNoCopy:guest_buffer length:len];
     env.objc.borrow_mut::<NSKeyedArchiverHostObject>(this).encoded_data = encoded_data;
     retain(env, encoded_data);
+    let output_data = env.objc.borrow::<NSKeyedArchiverHostObject>(this).output_data;
+    if output_data != nil {
+        () = msg![env; output_data appendData:encoded_data];
+    }
 }
 
 - (id)encodedData {
@@ -121,8 +163,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    let NSKeyedArchiverHostObject { encoded_data, .. } = *env.objc.borrow::<NSKeyedArchiverHostObject>(this);
+    let NSKeyedArchiverHostObject { encoded_data, output_data, .. } = *env.objc.borrow::<NSKeyedArchiverHostObject>(this);
     release(env, encoded_data);
+    release(env, output_data);
+    let already_archived = std::mem::take(
+        &mut env.objc.borrow_mut::<NSKeyedArchiverHostObject>(this).already_archived
+    );
+    for object in already_archived.into_keys() {
+        release(env, object);
+    }
     env.objc.dealloc_object(this, &mut env.mem);
 }
 
@@ -194,6 +243,10 @@ pub fn encode_object(env: &mut Environment, archiver: id, object: id) -> Uid {
             .push(Dictionary::new().into());
         let len = host_object.plist["$objects"].as_array().unwrap().len();
         let new_uid = Uid::new(len as u64 - 1);
+        // This must be done before encoding the object's contents, in case the
+        // object graph has cycles (otherwise this would recurse forever).
+        host_object.already_archived.insert(object, new_uid);
+        retain(env, object);
         if object == class {
             // If the class selector returns itself, we're encoding a Class
             let mut classname = None;
@@ -247,10 +300,15 @@ pub fn encode_object(env: &mut Environment, archiver: id, object: id) -> Uid {
                 .borrow_mut::<NSKeyedArchiverHostObject>(archiver)
                 .current_key = previous_key;
         }
-        let host_object = env.objc.borrow_mut::<NSKeyedArchiverHostObject>(archiver);
-        host_object.already_archived.insert(object, new_uid);
         new_uid
     }
+}
+
+fn encode_value_for_key(env: &mut Environment, archiver: id, key: id, value: Value) {
+    let key = normalize_key(env, key);
+    let scope = get_value_to_encode_for_current_key(env, archiver);
+    assert!(!scope.contains_key(&key));
+    scope.insert(key, value);
 }
 
 fn encode_object_for_key(env: &mut Environment, archiver: id, object: id, normalized_key: String) {

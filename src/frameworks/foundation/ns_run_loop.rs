@@ -8,7 +8,7 @@
 //! Resources:
 //! - Apple's [Threading Programming Guide](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/Introduction/Introduction.html)
 
-use super::{ns_string, ns_timer, NSTimeInterval};
+use super::{ns_string, ns_timer, NSTimeInterval, NSUInteger};
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::environment::ThreadId;
 use crate::frameworks::audio_toolbox::audio_queue::{handle_audio_queue, AudioQueueRef};
@@ -117,6 +117,29 @@ pub const CLASSES: ClassExports = objc_classes! {
     assert!(!host_object.timers.contains(&timer)); // TODO: what do we do here?
     host_object.timers.push(timer);
     ns_timer::set_run_loop(env, timer, this);
+}
+
+- (())performSelector:(SEL)selector
+                target:(id)target
+              argument:(id)argument
+                 order:(NSUInteger)_order
+                 modes:(id)_modes { // NSArray<NSRunLoopMode>*
+    // TODO: handle modes, and order (the priority relative to other requests)
+    add_perform_request(
+        env,
+        this,
+        target,
+        selector,
+        argument,
+        /* delay: */ None,
+        /* should_sync: */ false,
+    );
+}
+
+- (())cancelPerformSelector:(SEL)selector
+                     target:(id)target
+                   argument:(id)argument {
+    cancel_perform_requests(env, this, target, selector, argument);
 }
 
 - (())run {
@@ -292,6 +315,34 @@ pub(super) fn cancel_perform_requests(
     env.objc
         .borrow_mut::<NSRunLoopHostObject>(run_loop)
         .selector_objects = new_selector_objects;
+}
+
+/// Cancels all delayed selector requests for a target (i.e. ones made with
+/// `performSelector:withObject:afterDelay:`), as for
+/// `cancelPreviousPerformRequestsWithTarget:`.
+pub(super) fn cancel_all_delayed_perform_requests(env: &mut Environment, run_loop: id, target: id) {
+    log_dbg!(
+        "Removing all delayed object selector requests for {target:?} on run loop {run_loop:?}"
+    );
+    let host_object = env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop);
+    let (cancelled, kept): (VecDeque<_>, VecDeque<_>) =
+        std::mem::take(&mut host_object.selector_objects)
+            .into_iter()
+            .partition(|oss| oss.target == target && oss.due_by.is_some());
+    host_object.selector_objects = kept;
+    for ObjectSelectorSource {
+        target,
+        argument,
+        semaphore,
+        ..
+    } in cancelled
+    {
+        release(env, target);
+        release(env, argument);
+        if !semaphore.is_null() {
+            sem_post(env, semaphore);
+        }
+    }
 }
 
 /// Run the run loop for just a single iteration. This is a special mode just

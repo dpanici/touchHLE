@@ -16,7 +16,9 @@
 
 use super::ns_string::{from_rust_string, to_rust_string};
 use super::{NSTimeInterval, NSUInteger};
-use crate::frameworks::foundation::ns_run_loop::{add_perform_request, cancel_perform_requests};
+use crate::frameworks::foundation::ns_run_loop::{
+    add_perform_request, cancel_all_delayed_perform_requests, cancel_perform_requests,
+};
 use crate::frameworks::foundation::ns_thread::detach_new_thread_inner;
 use crate::libc::semaphore::{host_destroy_semaphore, sem_wait};
 use crate::mem::MutVoidPtr;
@@ -71,6 +73,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     cancel_perform_requests(env, run_loop, target, selector, arg);
 }
 
++ (())cancelPreviousPerformRequestsWithTarget:(id)target {
+    let run_loop: id = msg_class![env; NSRunLoop currentRunLoop];
+    cancel_all_delayed_perform_requests(env, run_loop, target);
+}
+
 + (bool)accessInstanceVariablesDirectly {
     true
 }
@@ -90,6 +97,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     let sig = *env.objc.class_get_method_signature(this, sel).unwrap();
     log_dbg!("instanceMethodSignatureForSelector: '{}' -> {:?}", sel.as_str(&env.mem), env.mem.cstr_at_utf8(sig));
     msg_class![env; NSMethodSignature signatureWithObjCTypes:sig]
+}
+
++ (())load {
+    // Do nothing. Subclasses' implementations may call this via super.
 }
 
 + (())initialize {

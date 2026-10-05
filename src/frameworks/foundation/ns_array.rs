@@ -164,9 +164,80 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     NSNotFound as NSUInteger
 }
+- (NSUInteger)indexOfObjectIdenticalTo:(id)object {
+    let count: NSUInteger = msg![env; this count];
+    for i in 0..count {
+        let curr_object: id = msg![env; this objectAtIndex:i];
+        if curr_object == object {
+            return i;
+        }
+    }
+    NSNotFound as NSUInteger
+}
 - (bool)containsObject:(id)object {
     let idx: NSUInteger = msg![env; this indexOfObject:object];
     idx != NSNotFound as NSUInteger
+}
+
+- (id)filteredArrayUsingPredicate:(id)predicate { // NSPredicate*
+    let count: NSUInteger = msg![env; this count];
+    let mut objects = Vec::new();
+    for i in 0..count {
+        let object: id = msg![env; this objectAtIndex:i];
+        if msg![env; predicate evaluateWithObject:object] {
+            objects.push(retain(env, object));
+        }
+    }
+    let res = from_vec(env, objects);
+    autorelease(env, res)
+}
+
+- (id)subarrayWithRange:(NSRange)range {
+    let mut objects = Vec::with_capacity(range.length as usize);
+    for i in range.location..(range.location + range.length) {
+        let object: id = msg![env; this objectAtIndex:i];
+        objects.push(retain(env, object));
+    }
+    let res = from_vec(env, objects);
+    autorelease(env, res)
+}
+
+- (id)sortedArrayUsingSelector:(SEL)comparator {
+    let array: id = msg![env; this mutableCopy];
+    () = msg![env; array sortUsingSelector:comparator];
+    let array_imm: id = msg![env; array copy];
+    release(env, array);
+    autorelease(env, array_imm)
+}
+
+- (())makeObjectsPerformSelector:(SEL)sel {
+    let count: NSUInteger = msg![env; this count];
+    for idx in 0..count {
+        let obj: id = msg![env; this objectAtIndex:idx];
+        let _: id = msg![env; obj performSelector:sel];
+    }
+}
+- (())makeObjectsPerformSelector:(SEL)sel withObject:(id)arg {
+    let count: NSUInteger = msg![env; this count];
+    for idx in 0..count {
+        let obj: id = msg![env; this objectAtIndex:idx];
+        let _: id = msg![env; obj performSelector:sel withObject:arg];
+    }
+}
+
+- (id)arrayByAddingObject:(id)object {
+    let array: id = msg![env; this mutableCopy];
+    () = msg![env; array addObject:object];
+    let array_imm: id = msg![env; array copy];
+    release(env, array);
+    autorelease(env, array_imm)
+}
+- (id)arrayByAddingObjectsFromArray:(id)other { // NSArray*
+    let array: id = msg![env; this mutableCopy];
+    () = msg![env; array addObjectsFromArray:other];
+    let array_imm: id = msg![env; array copy];
+    release(env, array);
+    autorelease(env, array_imm)
 }
 
 - (id)firstObject {
@@ -339,6 +410,25 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+- (())removeObjectsInArray:(id)other { // NSArray*
+    let count: NSUInteger = msg![env; other count];
+    for i in 0..count {
+        let object: id = msg![env; other objectAtIndex:i];
+        () = msg![env; this removeObject:object];
+    }
+}
+
+- (())removeObjectIdenticalTo:(id)object {
+    let count: NSUInteger = msg![env; this count];
+    // Iterate in reverse so removals don't affect the remaining indices.
+    for i in (0..count).rev() {
+        let curr_object: id = msg![env; this objectAtIndex:i];
+        if curr_object == object {
+            () = msg![env; this removeObjectAtIndex:i];
+        }
+    }
+}
+
 // NSCopying implementation
 - (id)copyWithZone:(NSZonePtr)_zone {
     let other: id = msg_class![env; NSArray alloc];
@@ -460,24 +550,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     build_description(env, this)
 }
 
-- (id)subarrayWithRange:(NSRange)range {
-    let mut tmp = Vec::new();
-    tmp.extend_from_slice(
-        &env.objc.borrow::<ArrayHostObject>(this).array[range.location as usize..(range.location + range.length) as usize]
-    );
-    for &obj in &tmp {
-        retain(env, obj);
-    }
-    let res = from_vec(env, tmp);
-    autorelease(env, res)
-}
-
-- (id)sortedArrayUsingSelector:(SEL)comparator {
-    let new = msg![env; this mutableCopy];
-    () = msg![env; new sortUsingSelector:comparator];
-    autorelease(env, new)
-}
-
 @end
 
 // Special variant for use by CFArray with NULL callbacks: objects aren't
@@ -569,14 +641,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     env.objc.dealloc_object(this, &mut env.mem)
-}
-
-- (())makeObjectsPerformSelector:(SEL)sel {
-    let count: NSUInteger = msg![env; this count];
-    for idx in 0..count {
-        let obj: id = msg![env; this objectAtIndex:idx];
-        let _: id = msg![env; obj performSelector:sel];
-    }
 }
 
 - (id)objectEnumerator { // NSEnumerator*
@@ -682,7 +746,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
     // TODO: runtime here is O(n^2), it could be O(n) instead
-    for i in to_remove {
+    // Iterate in reverse so removals don't affect the remaining indices.
+    for i in to_remove.into_iter().rev() {
         () = msg![env; this removeObjectAtIndex:i];
     }
 }

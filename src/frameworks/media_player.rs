@@ -6,6 +6,7 @@
 //! The Media Player framework.
 
 mod media_entity;
+mod media_item;
 mod media_item_collection;
 mod media_library;
 mod media_picker_controller;
@@ -21,13 +22,19 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         movie_player::CLASSES,
         music_player::CLASSES,
         media_entity::CLASSES,
+        media_item::CLASSES,
         media_item_collection::CLASSES,
         media_library::CLASSES,
         media_picker_controller::CLASSES,
         media_playlist::CLASSES,
         media_query::CLASSES,
     ],
-    constant_exports: &[movie_player::CONSTANTS, music_player::CONSTANTS],
+    constant_exports: &[
+        movie_player::CONSTANTS,
+        music_player::CONSTANTS,
+        media_item::CONSTANTS,
+        media_playlist::CONSTANTS,
+    ],
     function_exports: &[],
 };
 

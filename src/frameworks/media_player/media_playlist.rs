@@ -5,7 +5,16 @@
  */
 //! `MPMediaPlaylist`.
 
+use crate::dyld::{ConstantExports, HostConstant};
 use crate::objc::{objc_classes, ClassExports};
+
+pub const MPMediaPlaylistPropertyName: &str = "name";
+
+/// `NSString*` keys for `valueForProperty:`.
+pub const CONSTANTS: ConstantExports = &[(
+    "_MPMediaPlaylistPropertyName",
+    HostConstant::NSString(MPMediaPlaylistPropertyName),
+)];
 
 pub const CLASSES: ClassExports = objc_classes! {
 

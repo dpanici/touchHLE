@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
-use super::{Environment, ThreadId};
+use super::{Environment, ThreadBlock, ThreadId};
 use crate::libc::errno::{EBUSY, EDEADLK, EPERM};
 
 /// Stores and manages mutexes. Note that all the methods for locking and
@@ -153,6 +153,38 @@ impl Environment {
         }
     }
 
+    /// Give a just-unlocked mutex to one of the threads blocked on it, if any.
+    ///
+    /// Threads blocked on a mutex are otherwise only unblocked if the mutex
+    /// happens to be unlocked when the scheduler runs. A thread that locks and
+    /// unlocks the same mutex in a loop (e.g. polling some state) could then
+    /// starve the blocked thread forever, because preemption happens after a
+    /// fixed number of ticks and can keep landing in the same place in the
+    /// loop. Handing the mutex over avoids that, but it does not switch
+    /// threads: callers like `pthread_cond_wait` rely on unlocking not
+    /// yielding.
+    fn hand_over_unlocked_mutex(&mut self, mutex_id: MutexId) {
+        let thread_count = self.threads.len();
+        // Same order as the scheduler uses.
+        let Some(waiting_thread) = (1..thread_count)
+            .map(|i| (self.current_thread + i) % thread_count)
+            .find(|&thread_id| {
+                let thread = &self.threads[thread_id];
+                thread.is_running()
+                    && matches!(thread.blocked_by, ThreadBlock::Mutex(id) if id == mutex_id)
+            })
+        else {
+            return;
+        };
+        log_dbg!(
+            "Handing over mutex #{} to waiting thread {}.",
+            mutex_id,
+            waiting_thread
+        );
+        self.threads[waiting_thread].blocked_by = ThreadBlock::NotBlocked;
+        self.relock_unblocked_mutex_for_thread(waiting_thread, mutex_id);
+    }
+
     /// Locks a mutex and returns the lock count or an error (as errno). Similar
     /// to `pthread_mutex_lock`, but for host code.
     pub fn lock_mutex(&mut self, mutex_id: MutexId) -> Result<u32, i32> {
@@ -249,6 +281,9 @@ impl Environment {
                 current_thread
             );
             mutex.locked = None;
+            if mutex.waiting_count > 0 {
+                self.hand_over_unlocked_mutex(mutex_id);
+            }
             Ok(0)
         } else {
             assert!(mutex.type_ == MutexType::PTHREAD_MUTEX_RECURSIVE);

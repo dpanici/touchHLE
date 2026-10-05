@@ -55,6 +55,7 @@ type ExtAudioFileRef = MutPtr<OpaqueExtAudioFile>;
 type ExtAudioFilePropertyID = u32;
 const kExtAudioFileProperty_FileDataFormat: ExtAudioFilePropertyID = fourcc(b"ffmt");
 const kExtAudioFileProperty_ClientDataFormat: ExtAudioFilePropertyID = fourcc(b"cfmt");
+const kExtAudioFileProperty_FileLengthFrames: ExtAudioFilePropertyID = fourcc(b"#frm");
 
 fn ExtAudioFileOpenURL(
     env: &mut Environment,
@@ -110,6 +111,24 @@ fn ExtAudioFileGetProperty(
     out_property_data: MutVoidPtr,
 ) -> OSStatus {
     return_if_null!(in_ext_audio_file);
+
+    if in_property_id == kExtAudioFileProperty_FileLengthFrames {
+        if env.mem.read(io_property_data_size) != guest_size_of::<i64>() {
+            log!("Warning: ExtAudioFileGetProperty() failed");
+            return kAudioFileBadPropertySizeError;
+        }
+        let guest_audio_file = State::get(&mut env.framework_state).extended_audio_files
+            [&in_ext_audio_file]
+            .guest_audio_file;
+        let audio_file =
+            &env.framework_state.audio_toolbox.audio_file.audio_files[&guest_audio_file].audio_file;
+        // This is in terms of the file's sample rate, which we don't convert.
+        let frames =
+            audio_file.packet_count() * u64::from(audio_file.audio_description().frames_per_packet);
+        env.mem
+            .write(out_property_data.cast(), i64::try_from(frames).unwrap());
+        return 0; // success
+    }
 
     let audio_file_property_id = match in_property_id {
         kExtAudioFileProperty_FileDataFormat => kAudioFilePropertyDataFormat,
@@ -217,11 +236,19 @@ fn ExtAudioFileRead(
         .get(&in_ext_audio_file)
         .unwrap();
 
-    audio_buffer_list.buffers[0].number_channels =
-        host_object.client_data_format.unwrap().channels_per_frame;
+    // If the app didn't set a client data format, data is read in the file's
+    // own format (which is always linear PCM for the files we support).
+    let client_data_format = host_object.client_data_format.unwrap_or_else(|| {
+        let audio_file = &env.framework_state.audio_toolbox.audio_file.audio_files
+            [&host_object.guest_audio_file]
+            .audio_file;
+        AudioStreamBasicDescription::from_audio_description(audio_file.audio_description())
+    });
+
+    audio_buffer_list.buffers[0].number_channels = client_data_format.channels_per_frame;
 
     let number_frames = env.mem.read(io_number_frames);
-    let bytes_per_frame = host_object.client_data_format.unwrap().bytes_per_frame;
+    let bytes_per_frame = client_data_format.bytes_per_frame;
     let number_of_bytes = number_frames.checked_mul(bytes_per_frame).unwrap();
     let number_of_bytes_ptr = env.mem.alloc_and_write(number_of_bytes);
     let res = AudioFileReadBytes(

@@ -503,11 +503,22 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (NSRange)rangeOfString:(id)search_string
                  options:(NSStringCompareOptions)options { // NSString *
-    log_dbg!(
-        "[(NSString *){} rangeOfString:{} options:{}]",
-        to_rust_string(env, this), to_rust_string(env, search_string), options
-    );
     let len: NSUInteger = msg![env; this length];
+    let range = NSRange { location: 0, length: len };
+    msg![env; this rangeOfString:search_string options:options range:range]
+}
+
+- (NSRange)rangeOfString:(id)search_string // NSString *
+                 options:(NSStringCompareOptions)options
+                   range:(NSRange)range {
+    log_dbg!(
+        "[(NSString *){} rangeOfString:{} options:{} range:{:?}]",
+        to_rust_string(env, this), to_rust_string(env, search_string), options, range
+    );
+    let start = range.location;
+    // The search is limited to the range, so treat its end as the string's.
+    let len = range.location + range.length;
+    assert!(len <= msg![env; this length]);
     let len_search: NSUInteger = msg![env; search_string length];
     if len_search == 0 {
         return NSRange { location: NSNotFound as NSUInteger, length: 0 };
@@ -517,7 +528,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     match options {
         // 0 is for default options, which is NSLiteralSearch
         NSLiteralSearch | 0 => {
-            for i in 0..len {
+            for i in start..len {
                 if is_match_at_position(env, this, search_string, i, len, len_search, |a, b| a == b) {
                     return NSRange { location: i, length: len_search }
                 }
@@ -530,14 +541,14 @@ pub const CLASSES: ClassExports = objc_classes! {
                 };
                 a_c.to_lowercase().eq(b_c.to_lowercase())
             };
-            for i in 0..len {
+            for i in start..len {
                 if is_match_at_position(env, this, search_string, i, len, len_search, compare) {
                     return NSRange { location: i, length: len_search }
                 }
             }
         },
         NSBackwardsSearch => {
-            for i in (0..len).rev() {
+            for i in (start..len).rev() {
                 if is_match_at_position(env, this, search_string, i, len, len_search, |a, b| a == b) {
                     return NSRange { location: i, length: len_search }
                 }
@@ -1378,7 +1389,9 @@ pub const CLASSES: ClassExports = objc_classes! {
              length:(NSUInteger)len
            encoding:(NSStringEncoding)encoding {
     // TODO: error handling
-    let slice = env.mem.bytes_at(bytes, len);
+    // The pointer may be NULL if the length is zero, e.g. if the bytes came
+    // from a message to nil.
+    let slice = if len == 0 { &[] } else { env.mem.bytes_at(bytes, len) };
     let host_object = StringHostObject::decode(Cow::Borrowed(slice), encoding);
 
     *env.objc.borrow_mut(this) = host_object;
@@ -1598,7 +1611,9 @@ pub const CLASSES: ClassExports = objc_classes! {
              length:(NSUInteger)len
            encoding:(NSStringEncoding)encoding {
     // TODO: error handling
-    let slice = env.mem.bytes_at(bytes, len);
+    // The pointer may be NULL if the length is zero, e.g. if the bytes came
+    // from a message to nil.
+    let slice = if len == 0 { &[] } else { env.mem.bytes_at(bytes, len) };
     let host_object = StringHostObject::decode(Cow::Borrowed(slice), encoding);
 
     *env.objc.borrow_mut(this) = host_object;

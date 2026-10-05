@@ -243,6 +243,7 @@ fn serialize_plist(env: &mut Environment, plist: id) -> Value {
     let dict_class = env.objc.get_known_class("NSDictionary", &mut env.mem);
     let arr_class = env.objc.get_known_class("NSArray", &mut env.mem);
     let str_class = env.objc.get_known_class("NSString", &mut env.mem);
+    let data_class = env.objc.get_known_class("NSData", &mut env.mem);
 
     if env.objc.class_is_subclass_of(class, dict_class) {
         // only our internal implementation is supported
@@ -303,7 +304,8 @@ fn serialize_plist(env: &mut Environment, plist: id) -> Value {
             NSNumberHostObject::Char(c) => Value::from(*c),
             _ => todo!("num {:?}", num),
         }
-    } else if class == env.objc.get_known_class("NSData", &mut env.mem) {
+    } else if env.objc.class_is_subclass_of(class, data_class) {
+        // NSMutableData uses the same host object as NSData.
         let data = env.objc.borrow::<NSDataHostObject>(plist);
         let buffer_slice = env.mem.bytes_at(data.bytes.cast(), data.length);
         Value::Data(buffer_slice.to_vec())

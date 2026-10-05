@@ -8,12 +8,15 @@
 use super::ns_array;
 use super::ns_dictionary::DictionaryHostObject;
 use super::ns_enumerator::{fast_enumeration_helper, NSFastEnumerationState};
+use super::ns_keyed_archiver::{encode_object, get_value_to_encode_for_current_key};
+use super::ns_keyed_unarchiver;
 use super::NSUInteger;
 use crate::abi::DotDotDot;
 use crate::environment::Environment;
 use crate::mem::MutPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, retain, ClassExports, HostObject, NSZonePtr,
+    autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain, ClassExports,
+    HostObject, NSZonePtr, SEL,
 };
 
 /// Belongs to _touchHLE_NSSet
@@ -67,21 +70,134 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, new)
 }
 
++ (id)setWithSet:(id)set { // NSSet*
+    let new: id = msg![env; this alloc];
+    let new: id = msg![env; new initWithSet:set];
+    autorelease(env, new)
+}
+
+- (id)initWithSet:(id)set { // NSSet*
+    let objects: id = msg![env; set allObjects];
+    msg![env; this initWithArray:objects]
+}
+
 // NSCopying implementation
 - (id)copyWithZone:(NSZonePtr)_zone {
     retain(env, this)
 }
 
+// NSMutableCopying implementation
+- (id)mutableCopyWithZone:(NSZonePtr)_zone {
+    let new: id = msg_class![env; NSMutableSet alloc];
+    msg![env; new initWithSet:this]
+}
+
+// NSCoding implementation
+// Sets are archived like arrays, with an "NS.objects" array.
+// TODO: support other types of coders, not only NSKeyedArchiver
+- (id)initWithCoder:(id)coder {
+    // The objects are retained by the Vec, and then by the array.
+    let objects = ns_keyed_unarchiver::decode_current_array(env, coder);
+    let array = ns_array::from_vec(env, objects);
+    let new: id = msg![env; this initWithArray:array];
+    release(env, array);
+    new
+}
+- (())encodeWithCoder:(id)coder {
+    let objects: id = msg![env; this allObjects];
+    let count: NSUInteger = msg![env; objects count];
+    let mut encoded = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let object: id = msg![env; objects objectAtIndex:i];
+        encoded.push(plist::Value::Uid(encode_object(env, coder, object)));
+    }
+    let scope = get_value_to_encode_for_current_key(env, coder);
+    scope.insert("NS.objects".to_string(), plist::Value::Array(encoded));
+}
+
 - (bool)containsObject:(id)object {
+    let member: id = msg![env; this member:object];
+    member != nil
+}
+
+- (id)member:(id)object {
+    let enumerator: id = msg![env; this objectEnumerator];
+    loop {
+        let next: id = msg![env; enumerator nextObject];
+        if next == nil {
+            return nil;
+        }
+        if msg![env; next isEqual:object] {
+            return next;
+        }
+    }
+}
+
+- (bool)isSubsetOfSet:(id)other { // NSSet*
+    let enumerator: id = msg![env; this objectEnumerator];
+    loop {
+        let next: id = msg![env; enumerator nextObject];
+        if next == nil {
+            return true;
+        }
+        if !msg![env; other containsObject:next] {
+            return false;
+        }
+    }
+}
+
+- (bool)intersectsSet:(id)other { // NSSet*
     let enumerator: id = msg![env; this objectEnumerator];
     loop {
         let next: id = msg![env; enumerator nextObject];
         if next == nil {
             return false;
         }
-        if msg![env; next isEqual:object] {
+        if msg![env; other containsObject:next] {
             return true;
         }
+    }
+}
+
+- (bool)isEqualToSet:(id)other { // NSSet*
+    let count: NSUInteger = msg![env; this count];
+    let other_count: NSUInteger = msg![env; other count];
+    count == other_count && msg![env; this isSubsetOfSet:other]
+}
+
+- (id)setByAddingObject:(id)object {
+    let new: id = msg![env; this mutableCopy];
+    () = msg![env; new addObject:object];
+    immutable_copy_and_release(env, new)
+}
+
+- (id)setByAddingObjectsFromSet:(id)other { // NSSet*
+    let new: id = msg![env; this mutableCopy];
+    () = msg![env; new unionSet:other];
+    immutable_copy_and_release(env, new)
+}
+
+- (id)setByAddingObjectsFromArray:(id)array { // NSArray*
+    let new: id = msg![env; this mutableCopy];
+    () = msg![env; new addObjectsFromArray:array];
+    immutable_copy_and_release(env, new)
+}
+
+- (())makeObjectsPerformSelector:(SEL)selector {
+    let objects: id = msg![env; this allObjects];
+    let count: NSUInteger = msg![env; objects count];
+    for i in 0..count {
+        let object: id = msg![env; objects objectAtIndex:i];
+        () = msg_send(env, (object, selector));
+    }
+}
+
+- (())makeObjectsPerformSelector:(SEL)selector withObject:(id)argument {
+    let objects: id = msg![env; this allObjects];
+    let count: NSUInteger = msg![env; objects count];
+    for i in 0..count {
+        let object: id = msg![env; objects objectAtIndex:i];
+        () = msg_send(env, (object, selector, argument));
     }
 }
 
@@ -117,7 +233,41 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // NSCopying implementation
 - (id)copyWithZone:(NSZonePtr)_zone {
-    todo!(); // TODO: this should produce an immutable copy
+    let new: id = msg_class![env; NSSet alloc];
+    msg![env; new initWithSet:this]
+}
+
+- (())addObjectsFromArray:(id)array { // NSArray*
+    let count: NSUInteger = msg![env; array count];
+    for i in 0..count {
+        let object: id = msg![env; array objectAtIndex:i];
+        () = msg![env; this addObject:object];
+    }
+}
+
+- (())minusSet:(id)other { // NSSet*
+    let objects: id = msg![env; other allObjects];
+    let count: NSUInteger = msg![env; objects count];
+    for i in 0..count {
+        let object: id = msg![env; objects objectAtIndex:i];
+        () = msg![env; this removeObject:object];
+    }
+}
+
+- (())intersectSet:(id)other { // NSSet*
+    let objects: id = msg![env; this allObjects];
+    let count: NSUInteger = msg![env; objects count];
+    for i in 0..count {
+        let object: id = msg![env; objects objectAtIndex:i];
+        if !msg![env; other containsObject:object] {
+            () = msg![env; this removeObject:object];
+        }
+    }
+}
+
+- (())setSet:(id)other { // NSSet*
+    () = msg![env; this removeAllObjects];
+    () = msg![env; this unionSet:other];
 }
 
 @end
@@ -162,6 +312,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 // TODO: more init methods, etc
 
 // TODO: accessors
+- (bool)containsObject:(id)object {
+    let host_obj: SetHostObject = std::mem::take(env.objc.borrow_mut(this));
+    let contained = host_obj.dict.lookup(env, object) != nil;
+    *env.objc.borrow_mut(this) = host_obj;
+    contained
+}
+
 - (NSUInteger)count {
     env.objc.borrow_mut::<SetHostObject>(this).dict.count
 }
@@ -175,8 +332,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)allObjects {
-    let objects = env.objc.borrow_mut::<SetHostObject>(this).dict.iter_keys().collect();
-    ns_array::from_vec(env, objects)
+    all_objects_common(env, this)
 }
 
 - (id)objectEnumerator { // NSEnumerator*
@@ -247,6 +403,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // TODO: init methods etc
 
+- (bool)containsObject:(id)object {
+    let host_obj: SetHostObject = std::mem::take(env.objc.borrow_mut(this));
+    let contained = host_obj.dict.lookup(env, object) != nil;
+    *env.objc.borrow_mut(this) = host_obj;
+    contained
+}
+
 - (NSUInteger)count {
     env.objc.borrow_mut::<SetHostObject>(this).dict.count
 }
@@ -260,8 +423,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)allObjects {
-    let objects = env.objc.borrow_mut::<SetHostObject>(this).dict.iter_keys().collect();
-    ns_array::from_vec(env, objects)
+    all_objects_common(env, this)
 }
 
 - (id)objectEnumerator { // NSEnumerator*
@@ -326,6 +488,30 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+/// Shared implementation of `allObjects` for `_touchHLE_NSSet` and
+/// `_touchHLE_NSMutableSet`.
+fn all_objects_common(env: &mut Environment, this: id) -> id {
+    let objects: Vec<id> = env
+        .objc
+        .borrow::<SetHostObject>(this)
+        .dict
+        .iter_keys()
+        .collect();
+    for &object in &objects {
+        retain(env, object);
+    }
+    let array = ns_array::from_vec(env, objects);
+    autorelease(env, array)
+}
+
+/// Make an autoreleased immutable copy of a mutable set and release the
+/// original.
+fn immutable_copy_and_release(env: &mut Environment, mutable_set: id) -> id {
+    let new: id = msg![env; mutable_set copy];
+    release(env, mutable_set);
+    autorelease(env, new)
+}
 
 /// Helper method shared between `initWithObjects:` of `_touchHLE_NSSet` and
 /// `_touchHLE_NSMutableSet`

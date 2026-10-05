@@ -67,12 +67,40 @@ impl Bundle {
         }
     }
 
+    /// Create a bundle for a directory in the guest filesystem, e.g. a
+    /// resource bundle inside the app bundle. Unlike the app bundle, such a
+    /// bundle isn't required to have an `Info.plist`. Returns [None] if the
+    /// directory doesn't exist.
+    pub fn new_bundle_from_guest_path(fs: &Fs, path: &GuestPath) -> Option<Bundle> {
+        if !fs.is_dir(path) {
+            return None;
+        }
+        let plist = fs
+            .read(path.join("Info.plist"))
+            .ok()
+            .and_then(|bytes| Value::from_reader(Cursor::new(bytes)).ok())
+            .and_then(|plist| plist.into_dictionary())
+            .unwrap_or_default();
+        Some(Bundle {
+            path: path.to_owned(),
+            plist,
+        })
+    }
+
     pub fn bundle_path(&self) -> &GuestPath {
         &self.path
     }
 
     pub fn bundle_identifier(&self) -> &str {
         self.plist["CFBundleIdentifier"].as_string().unwrap()
+    }
+
+    /// Like [Self::bundle_identifier], but for bundles that might not have an
+    /// identifier (only the app bundle is guaranteed to have one).
+    pub fn bundle_identifier_if_any(&self) -> Option<&str> {
+        self.plist
+            .get("CFBundleIdentifier")
+            .and_then(|v| v.as_string())
     }
 
     pub fn bundle_version(&self) -> &str {
